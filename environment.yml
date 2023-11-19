@@ -9,7 +9,7 @@ dependencies:
   - trimesh
   - opencv
   - tensorboardX
-  - pytorch
+  - pytorch=1.8
   - numpy 
   - pandas
   - tqdm
@@ -17,10 +17,10 @@ dependencies:
   - rich
   - packaging
   - scipy
+  - imageio
+  - lpips
+  - torch-ema
   - pip:
-    - imageio
-    - lpips
-    - torch-ema
     - PyMCubes
     - pysdf
     - dearpygui
