@@ -258,11 +258,7 @@ def cal_xyzs(rays_o, rays_d, aabb_infer, num_steps=16):
     # After that, we can also use density to accelerate the rendering process by selectively choosing the number of points.
     # Not implemented in the final implementation due to time constraints.
 
-    # calculate deltas for each sample along the z axis
-    deltas = z_vals[..., 1:] - z_vals[..., :-1]  # [N, T+t-1]
-    deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
-
-    return xyzs, deltas, z_vals, fars, nears
+    return xyzs, z_vals, fars, nears, sample_dist
 
 
 def fast_hash_op(pos_grid):
@@ -573,6 +569,84 @@ def color(model_weights, dirs, geo_feat):
         color = model(input)
     return color
 
+def sample_pdf(bins, weights, n_samples, det=False):
+    """
+    This implementation is from NeRF
+    bins: [B, T], old_z_vals
+    weights: [B, T - 1], bin weights.
+    return: [B, n_samples], new_z_vals
+    """
+
+    # Get pdf
+    weights = weights + 1e-5  # prevent nans
+    pdf = weights / torch.sum(weights, -1, keepdim=True)
+    cdf = torch.cumsum(pdf, -1)
+    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)
+    # Take uniform samples
+    if det:
+        u = torch.linspace(0. + 0.5 / n_samples, 1. - 0.5 / n_samples, steps=n_samples).to(weights.device)
+        u = u.expand(list(cdf.shape[:-1]) + [n_samples])
+    else:
+        u = torch.rand(list(cdf.shape[:-1]) + [n_samples]).to(weights.device)
+
+    # Invert CDF
+    u = u.contiguous()
+    inds = torch.searchsorted(cdf, u, right=True)
+    below = torch.max(torch.zeros_like(inds - 1), inds - 1)
+    above = torch.min((cdf.shape[-1] - 1) * torch.ones_like(inds), inds)
+    inds_g = torch.stack([below, above], -1)  # (B, n_samples, 2)
+
+    matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
+    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
+    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
+
+    denom = (cdf_g[..., 1] - cdf_g[..., 0])
+    denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
+    t = (u - cdf_g[..., 0]) / denom
+    samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
+
+    return samples
+
+
+
+def upsample_zvals(z_vals, density_outputs, rays_o, rays_d, aabb, upsample_steps=128):
+    """
+    Upsamples the z-values and returns new XYZ coordinates and z-values.
+    Used in case of determining xyzs and z_vals for fine level sampling.
+
+    Args:
+        z_vals (torch.Tensor): The z-values of the input rays. Shape: [N, T].
+        density_outputs (dict): Dictionary containing density outputs.
+        rays_o (torch.Tensor): The origin coordinates of the rays. Shape: [N, 3].
+        rays_d (torch.Tensor): The direction vectors of the rays. Shape: [N, 3].
+        aabb (torch.Tensor): The axis-aligned bounding box. Shape: [6].
+        upsample_steps (int): The number of steps to upsample the z-values. Default: 128.
+
+    Returns:
+        torch.Tensor: The new XYZ coordinates. Shape: [N, t, 3].
+        torch.Tensor: The new z-values. Shape: [N, t].
+    """
+    if upsample_steps > 0:
+        density_scale = 1.0
+        with torch.no_grad():
+
+            deltas = z_vals[..., 1:] - z_vals[..., :-1]  # [N, T-1]
+            deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)  # [N, T]
+
+            alphas = 1 - torch.exp(-deltas * density_scale * density_outputs['sigma'].squeeze(-1))  # [N, T]
+            alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1)  # [N, T+1]
+            weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1]  # [N, T]
+
+            # sample new z_vals
+            z_vals_mid = (z_vals[..., :-1] + 0.5 * deltas[..., :-1])  # [N, T-1]
+            new_z_vals = sample_pdf(z_vals_mid, weights[:, 1:-1], upsample_steps, det=True).detach()  # [N, t]
+
+            new_xyzs = rays_o.unsqueeze(-2) + rays_d.unsqueeze(-2) * new_z_vals.unsqueeze(-1)  # [N, 1, 3] * [N, t, 1] -> [N, t, 3]
+            new_xyzs = torch.min(torch.max(new_xyzs, aabb[:3]), aabb[3:])  # a manual clip.
+
+        return new_xyzs, new_z_vals
+
+
 
 if __name__ == "__main__":
     # add command line argument to take img to render
@@ -594,7 +668,7 @@ if __name__ == "__main__":
     rays_d = results["rays_d"]
 
     # Take a center patch of ray_o and ray_d of size 100x100 pixels
-    patch_size = 300
+    patch_size = 100
     new_rays_o = torch.empty(3,patch_size*patch_size, 3)
     new_rays_d = torch.empty(3,patch_size*patch_size, 3)
     for i in range(patch_size):
@@ -607,6 +681,8 @@ if __name__ == "__main__":
 
     num_levels = 16
     C = 2
+    density_scale = 1
+    N = rays_o.shape[1]
     img = parser.parse_args().img
 
     # For each ray we sample 128 points along its direction
@@ -615,11 +691,11 @@ if __name__ == "__main__":
     # Calculating the xyzs, deltas, z_vals, fars and nears for a given ray
     # Resulting vector size is [num_rays, num_samples_per_ray, 3]
     aabb_infer = model_weights["aabb_infer"]
-    xyzs, deltas, z_vals, fars, nears = cal_xyzs(
+    xyzs, z_vals, fars, nears, sample_dist = cal_xyzs(
         rays_o[img], rays_d[img], aabb_infer, num_steps=num_steps
     )
 
-    torch.save([xyzs, deltas, z_vals, fars, nears], f"xyzs_{img}.pt")
+    torch.save([xyzs, z_vals, fars, nears, sample_dist], f"xyzs_{img}.pt")
     
     # Calculating the hash encodings for each xyzs
     # Here, we make use of torch.multiprocessing to parallelize the computation of hash encodings
@@ -627,7 +703,7 @@ if __name__ == "__main__":
     # optimal and can be improved by parallelizing over the number of rays as well. But due to time and
     # resource constraints, I have not implemented it.
     samples = xyzs.shape[0]
-    limit = 512
+    limit = 32
     ans = []
 
     # Reading the offsets and embeddings from the model weights
@@ -677,13 +753,76 @@ if __name__ == "__main__":
         sigma_net_pred = sigma(hash_encodings)
         density = torch.exp(sigma_net_pred[..., 0])
         geo_feat = sigma_net_pred[..., 1:]
-        density_outputs = {"density": density, "geo_feat": geo_feat}
+        density_outputs = {"sigma": density, "geo_feat": geo_feat}
+
+    for k, v in density_outputs.items():
+            density_outputs[k] = v.view(N, num_steps, -1)
+    
+
+    # As we know, NeRF uses coarse to fine sampling for calculating the density and color for each point along the ray
+    # So based on the coarse sampling done above, we now do fine sampling for each ray
+    # We calculate the hash encodings for each point in the fine sampling and then use the model to predict the density
+    # and geometric features for each point in the fine sampling
+    
+    # Finding new xyzs and new z_vals for each ray
+    upsample_steps = 128
+    new_xyzs, new_z_vals = upsample_zvals(z_vals,density_outputs, rays_o[img], rays_d[img],aabb_infer, upsample_steps = upsample_steps)
+    
+    samples = new_xyzs.shape[0]
+
+    new_hash_encodings = torch.empty(samples, upsample_steps, num_levels, C).to(device)
+    # Parallelizing the computation of hash encodings
+    for i in tqdm(range(samples // limit + 1), desc="Cal new densities"):
+        with mp.Pool(16) as pool:
+            if i * limit == min((i + 1) * limit, samples):
+                break
+            val = new_xyzs[i * limit : min((i + 1) * limit, samples), :, :]
+            new_hash_encodings[i * limit : min((i + 1) * limit, samples), :,:,:] = torch.stack(list(
+                pool.map(
+                    functools.partial(
+                        compute_hash_op, offsets=offsets, embeddings=embeddings
+                    ),
+                    val,
+                )
+            ))
+        del pool
+    
+    new_hash_encodings = new_hash_encodings.view(
+        new_hash_encodings.shape[0] * new_hash_encodings.shape[1], -1
+    )
+
+    with torch.no_grad():
+        print("Running density prediction")
+        new_sigma_net_pred = sigma(new_hash_encodings)
+        new_density = torch.exp(sigma_net_pred[..., 0])
+        new_geo_feat = sigma_net_pred[..., 1:]
+        new_density_outputs = {"sigma": new_density, "geo_feat": new_geo_feat}
+
+    for k, v in new_density_outputs.items():
+        new_density_outputs[k] = v.view(N, upsample_steps, -1)
+
+    z_vals = torch.cat([z_vals, new_z_vals], dim=1) # [N, T+t]
+    z_vals, z_index = torch.sort(z_vals, dim=1)
+
+    xyzs = torch.cat([xyzs, new_xyzs], dim=1) # [N, T+t, 3]
+    xyzs = torch.gather(xyzs, dim=1, index=z_index.unsqueeze(-1).expand_as(xyzs))
+
+    for k in density_outputs:
+        tmp_output = torch.cat([density_outputs[k], new_density_outputs[k]], dim=1)
+        density_outputs[k] = torch.gather(tmp_output, dim=1, index=z_index.unsqueeze(-1).expand_as(tmp_output))
+
+    deltas = z_vals[..., 1:] - z_vals[..., :-1] # [N, T+t-1]
+    deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
+    alphas = 1 - torch.exp(-deltas * density_scale * density_outputs['sigma'].squeeze(-1)) # [N, T+t]
+    alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # [N, T+t+1]
+    weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # [N, T+t]
+
+    for k, v in density_outputs.items():
+        density_outputs[k] = v.view(-1, v.shape[-1])
 
     N = xyzs.shape[0]
     num_steps = xyzs.shape[1]
 
-    for k, v in density_outputs.items():
-        density_outputs[k] = v.view(-1, v.shape[-1])
     torch.save(density_outputs, f"density_outputs_{img}_{num_steps}.pt")
     print("Density prediction done")
 
@@ -703,14 +842,9 @@ if __name__ == "__main__":
     # Now for each ray we calculate the alpha and weights, which will be used to
     # determine the final color and depth
     density_scale = 1
-    density = density_outputs["density"].view(N, num_steps, -1)
+    density = density_outputs["sigma"].view(N, num_steps, -1)
     rgbs = rgbs.reshape(N, num_steps, 3)
-    alphas = 1 - torch.exp(-deltas * density_scale * density.squeeze(-1))  # [N, T+t]
-    alphas_shifted = torch.cat(
-        [torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1
-    )  # [N, T+t+1]
-    weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1]  # [N, T+t]
-    weights_sum = weights.sum(dim=-1)
+    
     ori_z_vals = ((z_vals - nears) / (fars - nears)).clamp(0, 1)
 
     # calculate weighted depth
