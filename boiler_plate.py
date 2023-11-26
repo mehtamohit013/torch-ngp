@@ -269,8 +269,15 @@ def fast_hash_op(pos_grid):
     """
     Fast hashing function for calculating the hash encodings. Given a position grid, it calculates the spatial hash
     encoding for each point in the grid using the bitwise xor operation with prime numbers, choosen in the Instant NGP paper.
-    """
 
+    The function has been parallelized over the number of samples per ray and number of points for effective computation resulting in
+    pos_grid being a tensor of shape [2**3,num_samples_per_ray, 3]
+
+    Args:
+        pos_grid: [8 ,num_samples_per_ray, 3]
+    Returns:
+        result: [8, num_samples_per_ray]
+    """
     pos_grid = pos_grid.int()
     primes = [1, 2654435761, 805459861, 3674653429, 2097192037, 1434869437, 2165219737]
 
@@ -291,7 +298,16 @@ def get_grid_index_op(C, D, align_corners, hashmap_size, resolution, pos_grid, c
     hash encoding. But for higher levels, we need to calculate the hash encoding for each point in
     the grid.
 
+    The function has been parallelized over the number of samples per ray and number of points for effective computation resulting in
+    pos_grid being a tensor of shape [8,num_samples_per_ray, 3]
+
+    Args:
+        pos_grid: [8, num_samples_per_ray, 3]
+    Returns:
+        index: [8, num_samples_per_ray]
+
     """
+    print(pos_grid.shape)
 
     # Calcularing the stride for each axis in the position grid
     stride = torch.pow(resolution + 1, torch.arange(3)).to(device)
@@ -333,8 +349,12 @@ def compute_hash_op(xyzs, offsets, embeddings):
     The function has been parallelized over the number of samples per ray for effective computation resulting in
     xyzs being a tensor of shape [num_samples_per_ray, 3]
 
+    Args:
+        xyzs: [num_samples_per_ray, 3]
+
     Returns:
         ans: [num_samples_per_ray, num_levels, C]
+    
     """
 
     # Parameters for calculating the hash encoding
@@ -574,7 +594,7 @@ if __name__ == "__main__":
     img = parser.parse_args().img
 
     # For each ray we sample 128 points along its direction
-    num_steps = 16
+    num_steps = 4
 
     # Calculating the xyzs, deltas, z_vals, fars and nears for a given ray
     aabb_infer = model_weights["aabb_infer"]
