@@ -11,6 +11,7 @@ import functools
 import argparse
 from packaging import version as pver
 import json
+import cv2
 
 # mp.set_start_method('spawn', force=True)
 
@@ -22,6 +23,9 @@ model_weights = torch.load("foxnerf/checkpoints/ngp_ep0307.pth", map_location=de
 
 # ref: https://github.com/NVlabs/instant-ngp/blob/b76004c8cf478880227401ae763be4c02f80b62f/include/neural-graphics-primitives/nerf_loader.h#L50
 def nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0]):
+    """
+    Converting the camera pose from the nerf format to the ngp format
+    """
     # for the fox dataset, 0.33 scales camera radius to ~ 2
     new_pose = np.array(
         [
@@ -36,6 +40,9 @@ def nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0]):
 
 
 def custom_meshgrid(*args):
+    """
+    Custom Meshgrid
+    """
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
     if pver.parse(torch.__version__) < pver.parse("1.10"):
         return torch.meshgrid(*args)
@@ -44,6 +51,10 @@ def custom_meshgrid(*args):
 
 
 def read_transform(transform_path):
+    """
+    Reading the camera poses and instrinsics from the json file
+    """
+
     with open(transform_path, "r") as f:
         transform = json.load(f)
 
@@ -59,6 +70,7 @@ def read_transform(transform_path):
 
     for frame in frames:
         pose = np.array(frame["transform_matrix"], dtype=np.float32)
+        # Scaling the camera pose
         pose = nerf_matrix_to_ngp(pose, scale=0.33, offset=[0, 0, 0])
         poses.append(pose)
 
@@ -67,6 +79,7 @@ def read_transform(transform_path):
     # calculate mean radius of all camera poses
     radius = poses[:, :3, 3].norm(dim=-1).mean(0).item()
 
+    # Camera pose and intrinsics
     poses = poses.to(device)
     fl_x = transform["fl_x"]
     fl_y = transform["fl_y"]
@@ -77,8 +90,11 @@ def read_transform(transform_path):
     return poses, intrinsics, radius, int(H), int(W)
 
 
-def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
-    """get rays
+def generate_rays(poses, intrinsics, H, W, num_rays=-1, error_map=None, patch_size=1):
+    """
+    Calculating rays from the camera poses and instrinsics. Takes the follwing arguments:
+    In case of rendering, we take N = -1, resulting in 2,073,600 rays i.e. for each pixel,
+    we are taking a sample along the ray.
     Args:
         poses: [B, 4, 4], cam2world
         intrinsics: [4]
@@ -93,6 +109,7 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
     B = poses.shape[0]
     fx, fy, cx, cy = intrinsics
 
+    # Custom mesh grid
     i, j = custom_meshgrid(
         torch.linspace(0, W - 1, W, device=device),
         torch.linspace(0, H - 1, H, device=device),
@@ -101,8 +118,10 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
     j = j.t().reshape([1, H * W]).expand([B, H * W]) + 0.5
 
     results = {}
-
+    N = num_rays
     if N > 0:
+        # NOTE: Not used in final implementation.
+
         N = min(N, H * W)
         print(f"[get_rays] N = {N}")
         # if use patch-based sampling, ignore error_map
@@ -128,9 +147,12 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
             inds = inds.expand([B, N])
 
         elif error_map is None:
+            # Random Sampling for calculating the sampled points along the ray
+            # NOTE: not used in the final implementation
             inds = torch.randint(0, H * W, size=[N], device=device)  # may duplicate
             inds = inds.expand([B, N])
         else:
+            # NOTE: Not used in the final implementation
             # weighted sample on a low-reso grid
             inds_coarse = torch.multinomial(
                 error_map.to(device), N, replacement=False
@@ -162,8 +184,12 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
         results["inds"] = inds
 
     else:
+        # For a standard image, we take H = 1920, W = 1080, resulting in 2,073,600 rays
+        # NOTE: This is the final implementation in case of rendering.
         inds = torch.arange(H * W, device=device).expand([B, H * W])
 
+    # Calculating rays direction vectors along x,y, and z axis
+    # and normalizing the direction vectors
     zs = torch.ones_like(i)
     xs = (i - cx) / fx * zs
     ys = (j - cy) / fy * zs
@@ -171,42 +197,25 @@ def get_rays(poses, intrinsics, H, W, N=-1, error_map=None, patch_size=1):
     directions = directions / torch.norm(directions, dim=-1, keepdim=True)
     rays_d = directions @ poses[:, :3, :3].transpose(-1, -2)  # (B, N, 3)
 
+    # Calculating the rays origin
     rays_o = poses[..., :3, 3]  # [B, 3]
     rays_o = rays_o[..., None, :].expand_as(rays_d)  # [B, N, 3]
 
     results["rays_o"] = rays_o
     results["rays_d"] = rays_d
-
-    return results
-
-
-def generate_rays(poses, intrinsics, H, W, num_rays=-1, error_map=None, patch_size=1):
-    rays = get_rays(
-        poses,
-        intrinsics,
-        H,
-        W,
-        num_rays,
-        error_map=error_map,
-        patch_size=patch_size,
-    )
-
-    results = {
-        "H": H,
-        "W": W,
-        "rays_o": rays["rays_o"],
-        "rays_d": rays["rays_d"],
-    }
+    results["H"] = H
+    results["W"] = W
 
     return results
 
 
 def compute_near_far(rays_o, rays_d, aabb):
-    # Calculate intersection times with planes
+    """
+    Calculating the near and far intersection times with the axis-aligned bounding box
+    """
     t_min = (aabb[:3] - rays_o) / rays_d
     t_max = (aabb[3:] - rays_o) / rays_d
 
-    # Calculate near and far intersection times
     nears = torch.max(torch.min(t_min, t_max), dim=1)[0]
     fars = torch.min(torch.max(t_min, t_max), dim=1)[0]
 
@@ -214,32 +223,42 @@ def compute_near_far(rays_o, rays_d, aabb):
 
 
 def cal_xyzs(rays_o, rays_d, aabb_infer, num_steps=16):
+    """
+    For each ray, we sample 128 points along its direction
+    Args:
+        rays_o: [N, 3]
+        rays_d: [N, 3]
+        aabb_infer: [6]
+        num_steps: int
+    """
+
     pos0_ray_o = rays_o
     pos0_ray_d = rays_d
     N = pos0_ray_o.shape[0]
 
+    # calculate nears and fars for AABB for each ray
     nears, fars = compute_near_far(pos0_ray_o, pos0_ray_d, aabb_infer)
     nears = nears.unsqueeze_(-1)
     fars = fars.unsqueeze_(-1)
 
-    # print(nears.shape, fars.shape)
-
+    # uniform sampling along the z axis
     z_vals = torch.linspace(0.0, 1.0, num_steps, device=device).unsqueeze(0)  # [1, T]
     z_vals = z_vals.expand((N, num_steps))  # [N, T]
-    # print(z_vals.shape)
     z_vals = nears + (fars - nears) * z_vals  # [N, T], in [nears, fars]
 
     sample_dist = (fars - nears) / num_steps
 
-    # generate xyzs
+    # generate xyzs based on uniform sampling along the z axis
     xyzs = pos0_ray_o.unsqueeze(-2) + pos0_ray_d.unsqueeze(-2) * z_vals.unsqueeze(
         -1
     )  # [N, 1, 3] * [N, T, 1] -> [N, T, 3]
+    # Make sure the xyzs are within the aabb
     xyzs = torch.min(torch.max(xyzs, aabb_infer[:3]), aabb_infer[3:])  # a manual clip.
 
     # After that, we can also use density to accelerate the rendering process by selectively choosing the number of points.
+    # Not implemented in the final implementation due to time constraints.
 
-    # Currently not implementing the mask one.
+    # calculate deltas for each sample along the z axis
     deltas = z_vals[..., 1:] - z_vals[..., :-1]  # [N, T+t-1]
     deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1)
 
@@ -247,6 +266,11 @@ def cal_xyzs(rays_o, rays_d, aabb_infer, num_steps=16):
 
 
 def fast_hash_op(pos_grid):
+    """
+    Fast hashing function for calculating the hash encodings. Given a position grid, it calculates the spatial hash
+    encoding for each point in the grid using the bitwise xor operation with prime numbers, choosen in the Instant NGP paper.
+    """
+
     pos_grid = pos_grid.int()
     primes = [1, 2654435761, 805459861, 3674653429, 2097192037, 1434869437, 2165219737]
 
@@ -254,16 +278,28 @@ def fast_hash_op(pos_grid):
         device
     )
     for i in range(3):
+        # Calculating bitwise xor with prime numbers along spatial dimensions
         result = torch.bitwise_xor(result, pos_grid[:, :, i] * primes[i])
     return result
 
 
 def get_grid_index_op(C, D, align_corners, hashmap_size, resolution, pos_grid, ch=0):
+    """
+    Given a position grid local, it calculates the corresponding index in the hashmap for each
+    point in the grid. For low levels, i.e. coarse resolution, we don't have need to calculate the
+    hash encoding for each point as there is one to one mapping between the position grid and the
+    hash encoding. But for higher levels, we need to calculate the hash encoding for each point in
+    the grid.
+
+    """
+
+    # Calcularing the stride for each axis in the position grid
     stride = torch.pow(resolution + 1, torch.arange(3)).to(device)
     stride = stride.unsqueeze(0).expand(
         (pos_grid.shape[0], pos_grid.shape[1], -1)
     )  # [8,3]
 
+    # Calculating the index for each point in the position grid using the stride and pos grid local
     index = torch.empty([8, 3], dtype=torch.int64, device=device)
     index = pos_grid * stride  # [8,3]
 
@@ -277,31 +313,42 @@ def get_grid_index_op(C, D, align_corners, hashmap_size, resolution, pos_grid, c
 
     mask = (stride > hashmap_size).to(device)  # [8]
     index = index.int()
+
+    # Calculating the hash encoding for each point in the position grid
+    # until and unless the stride is greater than the hashmap size, there is one to one mapping
+    # between the position grid and the hash encoding and there is no need to calculate the hash encoding.
     index = torch.where(mask, fast_hash_op(pos_grid), index)
     del mask, stride
+
+    # Return the final index for each point in the position grid
     return (index % hashmap_size) * C + ch
 
 
 def compute_hash_op(xyzs, offsets, embeddings):
-    input_dim = 3
-    multires = 6
-    degree = 4
+    """
+    Given a point in xyzs, it calculates the hash encoding for that point by first calculating the
+    position grid local and then calculating the index for the position grid local in the hashmap.
+    Then using linear interpolation, it calculates the hash encoding for the point.
+
+    The function has been parallelized over the number of samples per ray for effective computation resulting in
+    xyzs being a tensor of shape [num_samples_per_ray, 3]
+
+    Returns:
+        ans: [num_samples_per_ray, num_levels, C]
+    """
+
+    # Parameters for calculating the hash encoding
+    # number of levels in the hashmap, base resolution, desired resolution, align_corners, per_level_scale
     num_levels = 16
-    level_dim = 2
     base_resolution = 16
-    log2_hashmap_size = 19
     desired_resolution = 4096
     align_corners = False
     per_level_scale = np.exp2(
         np.log2(desired_resolution / base_resolution) / (num_levels - 1)
     )
-    interpolation = "linear"
     bound = 2.0
 
-    # model_weights = torch.load('foxnerf/checkpoints/ngp_ep0307.pth', map_location=torch.device('cpu'))['model']
-
     # Normalize xyzs to [0,1]
-    # xyz = (self.xyzs[self.temp_hit[sn]] - self.xyz_min) / (self.xyz_delta)
     xyzs = (xyzs + bound) / (2 * bound)  # map to [0, 1]
     xyzs = xyzs.contiguous()
 
@@ -313,57 +360,57 @@ def compute_hash_op(xyzs, offsets, embeddings):
     )  # resolution multiplier at each level, apply log2 for later CUDA exp2f
     H = base_resolution  # base resolution
 
-    # embeddings = embeddings.flatten()
-
+    # len_sample denotes the number of samples per ray
     len_sample = xyzs.shape[0]
     ans = torch.empty(len_sample, num_levels, C).to(device)
-
-    # for sample_num in range(len_sample):
-    #     inputs = xyzs[sample_num, :]
-
     inputs = xyzs
 
+    # Iterating over all the levels in the hashmap from coarse to fine
     for level in range(num_levels):
+        # Calculating the hashmap size, scale and resolution for each level
+        # using the offsets in the model weights
         hashmap_size = offsets[level + 1] - offsets[level]
         scale = 2 ** (S * level) * H - 1.0
         resolution = math.ceil(scale) + 1
 
+        # Calculating the position grid local for each point in xyzs
         pos = inputs * scale + 0.5
         pos_grid = torch.floor(pos)
         pos -= pos_grid
 
+        # Calculating position grid local for each point in xyzs
         val0 = 1 << torch.arange(D)
         val0 = val0.expand((1 << D, pos.shape[0], -1))
-
         val1 = torch.arange(1 << D)
         val1 = val1.repeat((1 << D) // val1.shape[0], pos.shape[0] * D).reshape(
             1 << D, pos.shape[0], D
         )
-
         mask = (val0 & val1) == 0
-        # mask = mask.unsqueeze(0).expand((len_sample, -1, -1)).to(device)
-
         w = torch.where(mask, 1 - pos, pos)
         w = w.prod(dim=-1)
         pos_grid_local = torch.where(mask, pos_grid, pos_grid + 1)
-        # print(pos_grid_local.shape, pos_grid_local)
-        # 8,1
+
+        # Getting the grid index for each point in the position grid local
+        # [num_samples_per_ray,8, 3]
         index = get_grid_index_op(
             C, D, align_corners, hashmap_size, resolution, pos_grid_local
         )
 
+        # per, point we have two local features, so for all the 8 points in the position grid local
+        # we calculate the embeddings and then take the weighted sum of the embeddings i.e. linear interpolation
+        # to calculate the hash encoding for the point
         local_feature0 = (
             w * embeddings[(int(offsets[level]) * int(C) + index).long()]
         ).sum(dim=0)
+
         local_feature1 = (
             w * embeddings[(int(offsets[level]) * int(C) + index + 1).long()]
         ).sum(dim=0)
 
-        # ans[sample_num, level, :] = torch.tensor([local_feature0, local_feature1]).to(device)
-
         ans[:, level, :] = torch.cat(
             [local_feature0[:, None], local_feature1[:, None]], dim=-1
         ).to(device)
+
     del (
         inputs,
         xyzs,
@@ -378,11 +425,16 @@ def compute_hash_op(xyzs, offsets, embeddings):
         val0,
         val1,
     )
+
     return ans
 
 
 class sigma_net(nn.Module):
     def __init__(self) -> None:
+        """
+        Neural network to predict the density and geometric features for each sampled point along the ray
+        Takes in the hash encoding of the point as input
+        """
         super().__init__()
         self.linear1 = nn.Linear(32, 64, bias=False)
         self.linear2 = nn.Linear(64, 16, bias=False)
@@ -395,6 +447,13 @@ class sigma_net(nn.Module):
 
 
 def SHencoder(inputs):
+    """
+    This functions takes in the directions of the rays and calculates the spherical harmonics
+    encoding for each direction.
+
+    For instant NGP, we used the 4 degree spherical harmonics encoding.
+    """
+
     input_dim = 3
     degree = 4
     output_dim = 16
@@ -408,6 +467,7 @@ def SHencoder(inputs):
 
     x, y, z = inputs[:, 0], inputs[:, 1], inputs[:, 2]
 
+    # Calculate the spherical harmonics encoding for each direction
     xy = x * y
     xz = x * z
     yz = y * z
@@ -449,6 +509,10 @@ def SHencoder(inputs):
 
 class color_net(nn.Module):
     def __init__(self) -> None:
+        """
+        Neural network to predict the color for each sampled point along the ray
+        Takes in the spherical harmonics of the ray and the geometric features as input
+        """
         super().__init__()
         self.linear1 = nn.Linear(31, 64, bias=False)
         self.linear2 = nn.Linear(64, 64, bias=False)
@@ -465,6 +529,13 @@ class color_net(nn.Module):
 
 
 def color(model_weights, dirs, density_outputs):
+    """
+    Predicts the color for each sampled point along the ray
+    Consists of two parts:
+        1. SH encoding of the ray
+        2. Prediction of color using the SH encoding and the geometric features
+    """
+
     sh_encoding = SHencoder(dirs)
     geo_feat = density_outputs["geo_feat"]
 
@@ -481,16 +552,16 @@ def color(model_weights, dirs, density_outputs):
 
 
 if __name__ == "__main__":
-    # add command line argument to take img
-    parser = argparse.ArgumentParser(description="IDK")
+    # add command line argument to take img to render
+    parser = argparse.ArgumentParser(description="Instant NGP renderer from scratch")
+    parser.add_argument("--img", type=int, help="The image number", default=0)
 
-    # Add the arguments
-    parser.add_argument("img", type=int, help="The image number", default=0)
+    # Reading the camera poses and extracting the instrinsics from the json file
+    poses, intrinsics, radius, H, W = read_transform("data/fox/test_transform.json")
+    print("Successfully read the camera poses and instrinsics")
 
-    poses, intrinsics, radius, H, W = read_transform(
-        "data/fox/test_transform.json"
-    )
-
+    # Generating the rays from the camera poses and instrinsics
+    # For a standard image, we take H = 1920, W = 1080, resulting in 2,073,600 rays
     results = generate_rays(
         poses, intrinsics, H, W, num_rays=-1, error_map=None, patch_size=1
     )
@@ -498,28 +569,37 @@ if __name__ == "__main__":
 
     rays_o = results["rays_o"]
     rays_d = results["rays_d"]
-
     num_levels = 16
     C = 2
-    img = 0
+    img = parser.parse_args().img
 
-    offsets = model_weights["encoder.offsets"]
-    embeddings = model_weights["encoder.embeddings"].flatten()
+    # For each ray we sample 128 points along its direction
+    num_steps = 16
 
-    offsets.share_memory_()
-    embeddings.share_memory_()
-
-    num_steps = 128
-
+    # Calculating the xyzs, deltas, z_vals, fars and nears for a given ray
     aabb_infer = model_weights["aabb_infer"]
     xyzs, deltas, z_vals, fars, nears = cal_xyzs(
         rays_o[img], rays_d[img], aabb_infer, num_steps=num_steps
     )
     torch.save([xyzs, deltas, z_vals, fars, nears], f"xyzs_{img}.pt")
 
+    # Calculating the hash encodings for each xyzs
+    # Here, we make use of torch.multiprocessing to parallelize the computation of hash encodings
+    # over the CPU. We parallelize over the number of samples per ray. This parallelization is not
+    # optimal and can be improved by parallelizing over the number of rays as well. But due to time and
+    # resource constraints, I have not implemented it.
     samples = xyzs.shape[0]
     limit = 512
     ans = []
+
+    # Reading the offsets and embeddings from the model weights
+    # and sharing them over the CPU for parallelization
+    offsets = model_weights["encoder.offsets"]
+    embeddings = model_weights["encoder.embeddings"].flatten()
+    offsets.share_memory_()
+    embeddings.share_memory_()
+
+    # Parallelizing the computation of hash encodings
     for i in tqdm(range(samples // limit + 1)):
         with mp.Pool(16) as pool:
             if i * limit == min((i + 1) * limit, samples):
@@ -540,41 +620,46 @@ if __name__ == "__main__":
     hash_encodings = torch.cat(ans, dim=0)
     torch.save(hash_encodings, f"hash_encodings_{img}_{num_steps}.pt")
     print("Successfully saved hash encodings")
+
     hash_encodings = hash_encodings.view(
         hash_encodings.shape[0] * hash_encodings.shape[1], -1
     )
+    print("Hash Encodings done")
 
+    # Calculating the density and geometric features for each xyzs
+    # Creating the model and loading the model weights
     sigma = sigma_net()
     sigma.linear1.weight.data = model_weights["sigma_net.0.weight"]
     sigma.linear2.weight.data = model_weights["sigma_net.1.weight"]
     sigma = sigma.eval()
 
+    # Forward pass through the model over the hash encodings calculated
     with torch.no_grad():
         print("Running density prediction")
-        print("Hash Encoding Shape: ", hash_encodings.shape)
         sigma_net_pred = sigma(hash_encodings)
-        print(sigma_net_pred.shape)
         density = torch.exp(sigma_net_pred[..., 0])
         geo_feat = sigma_net_pred[..., 1:]
         density_outputs = {"density": density, "geo_feat": geo_feat}
-    print(density.shape, geo_feat.shape)
 
     N = xyzs.shape[0]
     num_steps = xyzs.shape[1]
 
     for k, v in density_outputs.items():
         density_outputs[k] = v.view(-1, v.shape[-1])
+    torch.save(density_outputs, f"density_outputs_{img}_{num_steps}.pt")
+    print("Density prediction done")
 
+    # Now we calculate the color for each sampled point along each ray
     rays_dir = rays_d[img]
     rays_dir = rays_dir[:, None, :].expand(-1, num_steps, -1)
 
     rgbs = color(model_weights, rays_dir.reshape(-1, 3), density_outputs)
-
     torch.save(rgbs, f"rgb_{img}_{num_steps}.pt")
-    torch.save(density_outputs, f"density_outputs_{img}_{num_steps}.pt")
+    print("Color prediction done and saved")
 
+    # Now for each ray we calculate the alpha and weights, which will be used to
+    # determine the final color and depth
     density_scale = 1
-
     density = density_outputs["density"].view(N, num_steps, -1)
     rgbs = rgbs.reshape(N, num_steps, 3)
     alphas = 1 - torch.exp(-deltas * density_scale * density.squeeze(-1))  # [N, T+t]
@@ -582,31 +667,34 @@ if __name__ == "__main__":
         [torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1
     )  # [N, T+t+1]
     weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1]  # [N, T+t]
-
     weights_sum = weights.sum(dim=-1)
-
     ori_z_vals = ((z_vals - nears) / (fars - nears)).clamp(0, 1)
+
+    # calculate weighted depth
     depth = torch.sum(weights * ori_z_vals, dim=-1)
 
-    # calculate color
+    # calculate weighted color
     image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2)
 
+    # save the image and depth tensors
     torch.save(image, f"image_{img}_{num_steps}.pt")
     torch.save(depth, f"depth_{img}_{num_steps}.pt")
+    print("Image and depth tensors calculated and saved")
 
+    # Now finally reshaping the tensors and saving it using opencv
     image = image.reshape(1920, 1080, 3)
     depth = depth.reshape(1920, 1080)
 
-    # Normalize the image to 255 and show it
+    # Normalize the image to 255 and save it
     image = image.cpu().numpy()
     image = image / image.max()
     image = image * 255
     image = image.astype(np.uint8)
-    import cv2
 
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     cv2.imwrite(f"image_{img}.png", image)
 
-    # Save depth
+    # normalize the depth to 255 and save it
     depth = depth.cpu().numpy()
     depth = depth / depth.max()
     depth = depth * 255
